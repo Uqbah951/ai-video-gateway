@@ -375,12 +375,6 @@ def get_job_status(job_id):
     if not job:
         return jsonify({"error": "Job not found"}), 404
         
-    return jsonify({
-        "job_id": job_id,
-        "status": job[0],
-        "video_url": job[1]
-    }), 200
-
 
 # ---------------------------------------------------------
 # 4. MOCK GPU WORKER
