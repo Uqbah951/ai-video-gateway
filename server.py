@@ -172,6 +172,25 @@ def mock_runpod_handler(job_id, job_input):
         print(f"[GPU WORKER] Webhook delivery failed: {e}")
 
 import os
+@app.route('/admin/keys', methods=['GET'])
+def admin_view_keys():
+    # Simple security check using an admin secret in the URL parameters or headers
+    # e.g., your-app.onrender.com/admin/keys?secret=my_secret_pass
+    secret = request.args.get('secret')
+    if secret != "markaz_secure_2026":
+        return "Unauthorized. Provide correct secret key.", 403
+
+    conn = sqlite3.connect('database.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, username, api_key, credits FROM users")
+    users = cursor.fetchall()
+    conn.close()
+
+    html = "<h2>Live API Keys & Users</h2><table border='1' cellpadding='8'><tr><th>ID</th><th>Username</th><th>API Key</th><th>Credits</th></tr>"
+    for user in users:
+        html += f"<tr><td>{user[0]}</td><td>{user[1]}</td><td><code>{user[2]}</code></td><td>{user[3]}</td></tr>"
+    html += "</table>"
+    return html
 
 if __name__ == '__main__':
     # Render assigns a port dynamically via os.environ.get("PORT")
