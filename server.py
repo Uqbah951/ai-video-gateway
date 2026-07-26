@@ -1,7 +1,6 @@
 import os
 import sqlite3
 import threading
-import time
 import uuid
 import requests
 from flask import Flask, request, jsonify, render_template
@@ -30,9 +29,16 @@ def init_db():
             job_id TEXT PRIMARY KEY,
             api_key TEXT,
             status TEXT,
-            video_url TEXT
+            video_url TEXT,
+            runpod_job_id TEXT
         )
     ''')
+    
+    # Safely upgrade existing databases without breaking them
+    try:
+        cursor.execute("ALTER TABLE jobs ADD COLUMN runpod_job_id TEXT")
+    except sqlite3.OperationalError:
+        pass # Column already exists
     
     cursor.execute('''
         INSERT OR IGNORE INTO users (api_key, email, credits)
@@ -100,7 +106,8 @@ def generate_video():
     conn.commit()
     conn.close()
     
-    threading.Thread(target=mock_runpod_handler, args=(job_id, data)).start()
+    # Send to the real RunPod function instead of the mock
+    threading.Thread(target=real_runpod_handler, args=(job_id, data)).start()
     
     return jsonify({
         "message": "Video generation started",
@@ -110,15 +117,31 @@ def generate_video():
 
 @app.route('/webhook', methods=['POST'])
 def webhook_receiver():
+    # RunPod will call this URL and we pull our internal job_id from the query parameters
+    job_id = request.args.get("job_id")
+    if not job_id:
+        return jsonify({"error": "Missing job_id"}), 400
+        
     data = request.get_json() or {}
-    job_id = data.get("job_id")
-    status = data.get("status")
-    video_url = data.get("video_url")
+    
+    # RunPod sends statuses like "COMPLETED", "FAILED", "IN_PROGRESS"
+    runpod_status = data.get("status")
     
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("UPDATE jobs SET status = ?, video_url = ? WHERE job_id = ?",
-                   (status, video_url, job_id))
+    
+    if runpod_status == "COMPLETED":
+        # Adjust "video_url" below based on what exact key your RunPod AI returns in its output dict
+        output = data.get("output", {})
+        video_url = output.get("video_url") or output.get("url")
+        
+        cursor.execute("UPDATE jobs SET status = ?, video_url = ? WHERE job_id = ?",
+                       ("completed", video_url, job_id))
+                       
+    elif runpod_status in ["FAILED", "CANCELLED"]:
+        cursor.execute("UPDATE jobs SET status = ? WHERE job_id = ?",
+                       ("failed", job_id))
+                       
     conn.commit()
     conn.close()
     
@@ -141,20 +164,60 @@ def get_job_status(job_id):
         "video_url": job[1]
     }), 200
 
-def mock_runpod_handler(job_id, job_input):
-    time.sleep(4)
-    video_url = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4"
+# ---------------------------------------------------------
+# 4. REAL RUNPOD INTEGRATION
+# ---------------------------------------------------------
+def real_runpod_handler(job_id, job_input):
+    runpod_api_key = os.environ.get("RUNPOD_API_KEY")
+    endpoint_id = os.environ.get("RUNPOD_ENDPOINT_ID")
+    base_url = os.environ.get("BASE_URL") # e.g., https://your-app.onrender.com
     
-    port = int(os.environ.get("PORT", 5000))
-    try:
-        requests.post(f"http://127.0.0.1:{port}/webhook", json={
-            "job_id": job_id,
-            "status": "completed",
-            "video_url": video_url
-        })
-    except Exception as e:
-        print(f"Webhook error: {e}")
+    if not all([runpod_api_key, endpoint_id, base_url]):
+        print("ERROR: Missing RunPod Environment Variables.")
+        conn = sqlite3.connect(DB_NAME)
+        conn.execute("UPDATE jobs SET status = 'failed' WHERE job_id = ?", (job_id,))
+        conn.commit()
+        conn.close()
+        return
 
+    url = f"https://api.runpod.ai/v2/{endpoint_id}/run"
+    headers = {
+        "Authorization": f"Bearer {runpod_api_key}",
+        "Content-Type": "application/json"
+    }
+    
+    # We pass our webhook URL containing our internal job_id
+    # so RunPod knows exactly where to send the finished data.
+    payload = {
+        "input": {
+            "prompt": job_input.get("prompt", "cinematic drone shot")
+            # Add other model-specific inputs here (width, height, frames, etc.)
+        },
+        "webhook": f"{base_url}/webhook?job_id={job_id}"
+    }
+    
+    try:
+        response = requests.post(url, headers=headers, json=payload)
+        response.raise_for_status()
+        runpod_data = response.json()
+        
+        # Save RunPod's unique ID to our database just in case we need it later
+        runpod_job_id = runpod_data.get("id")
+        conn = sqlite3.connect(DB_NAME)
+        conn.execute("UPDATE jobs SET runpod_job_id = ? WHERE job_id = ?", (runpod_job_id, job_id))
+        conn.commit()
+        conn.close()
+        
+    except Exception as e:
+        print(f"Failed to communicate with RunPod: {e}")
+        conn = sqlite3.connect(DB_NAME)
+        conn.execute("UPDATE jobs SET status = 'failed' WHERE job_id = ?", (job_id,))
+        conn.commit()
+        conn.close()
+
+# ---------------------------------------------------------
+# 5. ADMIN PANEL
+# ---------------------------------------------------------
 @app.route('/admin/keys', methods=['GET'])
 def admin_view_keys():
     secret = request.args.get('secret')
